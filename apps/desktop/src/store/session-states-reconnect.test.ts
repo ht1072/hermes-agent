@@ -13,8 +13,10 @@ import {
 } from './session'
 import {
   $attentionSessionIds,
+  $sessionStates,
   $stalledSessionIds,
   $workingSessionIds,
+  captureBusyStatesForReconnect,
   clearAllSessionStates,
   publishSessionState,
   reconcileBusyStatesOnReconnect,
@@ -191,6 +193,81 @@ describe('reconcileBusyStatesOnReconnect', () => {
 
     reconcileBusyStatesOnReconnect(registryBackendScopeKey('connA', 'default'))
 
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+  })
+
+  it('does not retire a fresh active claim published after the reconnect snapshot', () => {
+    const stale = state({ awaitingResponse: true, busy: true, storedSessionId: 'stale-session' })
+    publishSessionState('stale-runtime', stale)
+    const staleSnapshot = captureBusyStatesForReconnect()
+
+    publishSessionState(
+      'fresh-runtime',
+      state({ awaitingResponse: true, busy: true, storedSessionId: 'fresh-session' })
+    )
+    $activeSessionId.set('fresh-runtime')
+    $busy.set(true)
+    $awaitingResponse.set(true)
+
+    reconcileBusyStatesOnReconnect(undefined, staleSnapshot)
+
+    expect($sessionStates.get()['fresh-runtime']).toMatchObject({ awaitingResponse: true, busy: true })
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+  })
+
+  it('moves a legacy secondary runtime back to primary ownership explicitly', () => {
+    const live = state({ busy: true, storedSessionId: 'session-1' })
+
+    publishSessionState('runtime-1', live)
+    recordSessionEventScope({ profile: 'selena', session_id: 'runtime-1' }, 'selena')
+
+    reconcileBusyStatesOnReconnect()
+    expect($sessionStates.get()['runtime-1']).toBe(live)
+
+    recordSessionEventScope({ profile: 'default', session_id: 'runtime-1' }, null)
+    reconcileBusyStatesOnReconnect()
+
+    expect($sessionStates.get()['runtime-1']).toMatchObject({ awaitingResponse: false, busy: false })
+  })
+
+  it('preserves a runtime that moves to another socket after the reconnect snapshot', () => {
+    const stale = state({ awaitingResponse: true, busy: true, storedSessionId: 'session-1' })
+    const cache = new Map<string, ClientSessionState>([['runtime-1', stale]])
+    const oldScope = registryBackendScopeKey('connA', 'default')
+
+    publishSessionState('runtime-1', stale)
+    recordSessionEventScope({ connectionId: 'connA', profile: 'default', session_id: 'runtime-1' })
+    const staleSnapshot = captureBusyStatesForReconnect(oldScope)
+
+    // Fan-in records ownership before an event updater runs. A no-op event can
+    // therefore move the runtime to another socket without replacing its state.
+    recordSessionEventScope({ connectionId: 'connB', profile: 'default', session_id: 'runtime-1' })
+    setSessionTileDelegate(tileDelegate(cache))
+
+    reconcileBusyStatesOnReconnect(oldScope, staleSnapshot)
+
+    expect(cache.get('runtime-1')).toBe(stale)
+    expect($sessionStates.get()['runtime-1']).toBe(stale)
+  })
+
+  it('does not retire a runtime that republishes after the reconnect snapshot', () => {
+    const stale = state({ awaitingResponse: true, busy: true, storedSessionId: 'session-1' })
+
+    publishSessionState('runtime-1', stale)
+    const staleSnapshot = captureBusyStatesForReconnect()
+    const fresh = state({ awaitingResponse: true, busy: true, storedSessionId: 'session-1' })
+
+    publishSessionState('runtime-1', fresh)
+    setSessionTileDelegate(tileDelegate(new Map([['runtime-1', fresh]])))
+    $activeSessionId.set('runtime-1')
+    $busy.set(true)
+    $awaitingResponse.set(true)
+
+    reconcileBusyStatesOnReconnect(undefined, staleSnapshot)
+
+    expect($sessionStates.get()['runtime-1']).toBe(fresh)
     expect($busy.get()).toBe(true)
     expect($awaitingResponse.get()).toBe(true)
   })

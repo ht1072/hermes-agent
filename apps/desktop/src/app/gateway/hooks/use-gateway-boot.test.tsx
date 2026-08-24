@@ -1,11 +1,26 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $desktopBoot } from '@/store/boot'
 import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
-import { $awaitingResponse, $busy, $connection, $currentCwd, $gatewayState } from '@/store/session'
+import {
+  $activeSessionId,
+  $awaitingResponse,
+  $busy,
+  $connection,
+  $currentCwd,
+  $gatewayState
+} from '@/store/session'
+import {
+  $sessionStates,
+  clearAllSessionStates,
+  publishSessionState,
+  reconcileBusyStatesOnReconnect,
+  recordSessionEventScope
+} from '@/store/session-states'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -70,6 +85,12 @@ class FakeWebSocket {
   drop() {
     this.readyState = FakeWebSocket.CLOSED
     this.emit('close', {})
+  }
+
+  message(event: { session_id?: string; type: string }) {
+    this.emit('message', {
+      data: JSON.stringify({ jsonrpc: '2.0', method: 'event', params: event })
+    })
   }
 
   private emit(type: string, ev: unknown) {
@@ -161,6 +182,8 @@ beforeEach(() => {
   }
 
   closeSecondaryGateways()
+  clearAllSessionStates()
+  $activeSessionId.set(null)
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
@@ -201,6 +224,8 @@ afterEach(() => {
   }
 
   closeSecondaryGateways()
+  clearAllSessionStates()
+  $activeSessionId.set(null)
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
@@ -421,6 +446,114 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($gatewayState.get()).toBe('open')
     expect($busy.get()).toBe(false)
     expect($awaitingResponse.get()).toBe(false)
+  })
+
+  it('moves a runtime back to primary ownership at the real gateway event fan-in', async () => {
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    const live = {
+      ...createClientSessionState('stored-primary'),
+      awaitingResponse: true,
+      busy: true
+    }
+
+    publishSessionState('runtime-primary', live)
+    recordSessionEventScope({ profile: 'coder', session_id: 'runtime-primary' }, 'coder')
+
+    act(() => {
+      FakeWebSocket.instances[0].message({ session_id: 'runtime-primary', type: 'message.delta' })
+    })
+    reconcileBusyStatesOnReconnect()
+
+    expect($sessionStates.get()['runtime-primary']).toMatchObject({ awaitingResponse: false, busy: false })
+  })
+
+  it('releases the primary reconnect guard when snapshot capture throws', async () => {
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    const originalGet = $sessionStates.get.bind($sessionStates)
+
+    const getSpy = vi.spyOn($sessionStates, 'get').mockImplementationOnce(() => {
+      throw new Error('snapshot failed')
+    })
+
+    act(() => FakeWebSocket.instances[0].drop())
+    await act(async () => {
+      await reconnectGateway()
+    })
+    expect($gatewayState.get()).toBe('closed')
+
+    getSpy.mockImplementation(originalGet)
+    await act(async () => {
+      const reconnect = reconnectGateway()
+      await vi.advanceTimersByTimeAsync(0)
+      await reconnect
+    })
+
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect($gatewayState.get()).toBe('open')
+    getSpy.mockRestore()
+  })
+
+  it('preserves a fresh active busy claim published while primary reconnect awaits', async () => {
+    const desktop = fakeDesktop()
+    const originalRevalidate = desktop.revalidateConnection
+    let releaseRevalidate: () => void = () => undefined
+
+    const revalidateGate = new Promise<void>(resolve => {
+      releaseRevalidate = resolve
+    })
+
+    desktop.revalidateConnection = vi.fn(async () => {
+      await revalidateGate
+
+      return originalRevalidate()
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    publishSessionState('stale-runtime', {
+      ...createClientSessionState('stale-session'),
+      awaitingResponse: true,
+      busy: true
+    })
+    $activeSessionId.set('stale-runtime')
+    $busy.set(true)
+    $awaitingResponse.set(true)
+
+    act(() => FakeWebSocket.instances[0].drop())
+    const reconnect = reconnectGateway()
+    await flushAsync()
+    expect(desktop.revalidateConnection).toHaveBeenCalledOnce()
+
+    act(() => {
+      publishSessionState('fresh-runtime', {
+        ...createClientSessionState('fresh-session'),
+        awaitingResponse: true,
+        busy: true
+      })
+      $activeSessionId.set('fresh-runtime')
+      $busy.set(true)
+      $awaitingResponse.set(true)
+      releaseRevalidate()
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await reconnect
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($sessionStates.get()['fresh-runtime']).toMatchObject({ awaitingResponse: true, busy: true })
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
   })
 
   it('manual reconnect revalidates, re-resolves, re-mints, and re-dials the dropped socket', async () => {

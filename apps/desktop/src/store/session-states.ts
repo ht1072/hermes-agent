@@ -66,14 +66,27 @@ export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 // connected gateways can both expose a 'default' profile, so the gateway
 // keep-set (pruneSecondaryGateways) must key live work by the composite
 // (connectionId, profile) scope, not the bare profile name. Recorded at
-// event fan-in (use-gateway-boot); local/primary events carry no connectionId
-// and record nothing, so single-source behavior is untouched.
+// source scope is supplied explicitly by the gateway registry so legacy
+// profile secondaries (no connectionId) are still distinct from the primary.
+// A null source is an authoritative primary event and clears any older owner;
+// undefined keeps the event-derived fallback for tests and compatibility.
 // ---------------------------------------------------------------------------
 
 const sessionScopeByRuntimeId = new Map<string, string>()
 
-export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
-  if (event.session_id && event.connectionId) {
+export function recordSessionEventScope(
+  event: { connectionId?: string; profile?: string; session_id?: string },
+  sourceScope?: null | string
+): void {
+  if (!event.session_id) {
+    return
+  }
+
+  if (sourceScope === null) {
+    sessionScopeByRuntimeId.delete(event.session_id)
+  } else if (sourceScope !== undefined) {
+    sessionScopeByRuntimeId.set(event.session_id, sourceScope)
+  } else if (event.connectionId) {
     sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
   }
 }
@@ -387,11 +400,12 @@ export function clearAllSessionStates() {
  *  hours after the turn actually ended (#53902, #73082 — stale-flag half).
  *
  *  `scope` picks which socket's sessions to reconcile, keyed by the event-
- *  source scope recorded at fan-in: a SECONDARY (registry) reconnect passes
- *  its composite scope and touches only runtimes that arrived on that socket;
- *  the PRIMARY reconnect passes undefined and touches only scope-less
- *  runtimes (primary/local events record no scope). Neither can clear live
- *  work riding a different, still-healthy connection.
+ *  source scope recorded at fan-in: a SECONDARY reconnect passes its registry
+ *  scope (composite for a saved connection, bare profile for a legacy/local
+ *  profile backend) and touches only runtimes delivered by that socket. The
+ *  PRIMARY reconnect passes undefined and touches only scope-less runtimes;
+ *  primary events explicitly clear any older secondary owner. Neither can
+ *  clear live work riding a different, still-healthy connection.
  *
  *  Direction of failure is deliberate: a turn that IS still live (transient
  *  socket blip, same backend) re-asserts busy on its next event or inflight
@@ -412,8 +426,11 @@ export function clearAllSessionStates() {
  *  wiring mounted). A PRIMARY reconcile also clears the focused draft
  *  latches, which outlive the state they mirrored; a scoped one leaves them
  *  alone — a background socket says nothing about the primary composer. */
-export function reconcileBusyStatesOnReconnect(scope?: string) {
-  const states = $sessionStates.get()
+export type BusyReconnectSnapshot = ReadonlyMap<string, ClientSessionState>
+
+export function captureBusyStatesForReconnect(scope?: string): BusyReconnectSnapshot {
+  const states: Record<string, ClientSessionState> = $sessionStates.get()
+  const snapshot = new Map<string, ClientSessionState>()
 
   for (const [runtimeId, state] of Object.entries(states)) {
     if (!state || (!state.busy && !state.awaitingResponse)) {
@@ -422,7 +439,27 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 
     const recorded = sessionScopeByRuntimeId.get(runtimeId)
 
-    if (scope === undefined ? recorded !== undefined : recorded !== scope) {
+    if (scope === undefined ? recorded === undefined : recorded === scope) {
+      snapshot.set(runtimeId, state)
+    }
+  }
+
+  return snapshot
+}
+
+export function reconcileBusyStatesOnReconnect(
+  scope?: string,
+  staleClaims: BusyReconnectSnapshot = captureBusyStatesForReconnect(scope)
+) {
+  for (const [runtimeId, staleState] of staleClaims) {
+    const state = $sessionStates.get()[runtimeId]
+    const recorded = sessionScopeByRuntimeId.get(runtimeId)
+
+    // Every publish replaces the state object. A different object means this
+    // runtime received fresh post-snapshot state. Scope is checked separately:
+    // fan-in records the new socket owner before an event updater can decide the
+    // state itself is unchanged, so an ownership-only move must also survive.
+    if (state !== staleState || (scope === undefined ? recorded !== undefined : recorded !== scope)) {
       continue
     }
 
@@ -431,14 +468,24 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
     // Re-read — the write path may have republished (and released) this entry.
     const published = $sessionStates.get()[runtimeId]
 
-    if (published?.busy || published?.awaitingResponse) {
+    if (published === staleState && (published.busy || published.awaitingResponse)) {
       publishSessionState(runtimeId, { ...published, awaitingResponse: false, busy: false })
     }
   }
 
   if (scope === undefined) {
-    setBusy(false)
-    setAwaitingResponse(false)
+    const activeRuntimeId = $activeSessionId.get()
+    const activeState = activeRuntimeId ? $sessionStates.get()[activeRuntimeId] : null
+
+    // A reconnect reconcile can finish after the user has already submitted on
+    // a freshly rebound runtime. Preserve that runtime's authoritative claim;
+    // otherwise this late cleanup unlocks the composer in the middle of its new
+    // turn. Background runtimes do not count — only the focused runtime owns
+    // these draft latches.
+    if (!activeState?.busy && !activeState?.awaitingResponse) {
+      setBusy(false)
+      setAwaitingResponse(false)
+    }
   }
 }
 

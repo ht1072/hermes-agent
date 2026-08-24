@@ -51,6 +51,7 @@ import {
 import {
   $attentionSessionIds,
   $workingSessionIds,
+  captureBusyStatesForReconnect,
   liveSessionScopes,
   reconcileBusyStatesOnReconnect,
   recordSessionEventScope,
@@ -209,6 +210,8 @@ export function useGatewayBoot({
       reconnecting = true
 
       try {
+        const staleBusyClaims = captureBusyStatesForReconnect()
+
         // Drop a stale REMOTE backend cache before re-dialing. After sleep/wake a
         // remote backend can become unreachable, but it has no child process
         // whose 'exit' would clear the main process's cached descriptor — without
@@ -258,7 +261,7 @@ export function useGatewayBoot({
         // busy:false — clear them or the sidebar running arc lies forever
         // (#53902/#73082). A genuinely live turn re-asserts busy on its next
         // post-reconnect event.
-        reconcileBusyStatesOnReconnect()
+        reconcileBusyStatesOnReconnect(undefined, staleBusyClaims)
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -478,6 +481,11 @@ export function useGatewayBoot({
     // (connectionId, profile) keep-set so two sources exposing the same
     // profile name (every source has a 'default') can't collide.
     configureGatewayRegistry({
+      captureScopedReconnectCleanup: scope => {
+        const staleBusyClaims = captureBusyStatesForReconnect(scope)
+
+        return () => reconcileBusyStatesOnReconnect(scope, staleBusyClaims)
+      },
       onActiveConnectionChanged: publish,
       // Keep $activeGatewayProfile in lockstep with the registry's OWN record
       // of which profile the active socket serves. The registry is the only
@@ -496,8 +504,8 @@ export function useGatewayBoot({
           $activeGatewayProfile.set(key)
         }
       },
-      onEvent: event => {
-        recordSessionEventScope(event)
+      onEvent: (event, sourceScope) => {
+        recordSessionEventScope(event, sourceScope)
         callbacksRef.current.handleGatewayEvent(event)
       },
       onActiveConnectionInvalidated: (fallbackProfile, invalidationEpoch) => {
@@ -546,9 +554,10 @@ export function useGatewayBoot({
 
     const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
-    const offEvent = gateway.onEvent(event =>
+    const offEvent = gateway.onEvent(event => {
+      recordSessionEventScope(event, null)
       callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
-    )
+    })
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.

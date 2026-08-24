@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { createClientSessionState } from '@/lib/chat-runtime'
+import type * as SessionStore from '@/store/session'
+
+import {
+  $sessionStates,
+  captureBusyStatesForReconnect,
+  clearAllSessionStates,
+  publishSessionState,
+  reconcileBusyStatesOnReconnect,
+  recordSessionEventScope
+} from './session-states'
+
 // Connection lifecycle for registry-scoped secondary gateways:
 //
 //  1. Removing a connection must dispose its secondaries — remote/cloud
@@ -13,7 +25,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 //     the entry instead of retrying forever.
 
 const gatewayMocks = vi.hoisted(() => {
-  const instances: { close: ReturnType<typeof vi.fn>; connectionState: string }[] = []
+  const instances: {
+    close: ReturnType<typeof vi.fn>
+    connectionState: string
+    emitEvent: (event: unknown) => void
+  }[] = []
 
   return {
     connect: vi.fn(async (_wsUrl: string): Promise<void> => undefined),
@@ -23,8 +39,10 @@ const gatewayMocks = vi.hoisted(() => {
 
 vi.mock('@/hermes', () => ({
   setApiRequestConnection: vi.fn(),
+  setApiRequestProfile: vi.fn(),
   HermesGateway: class {
     connectionState = 'closed'
+    private eventListener: null | ((event: unknown) => void) = null
     close = vi.fn(() => {
       this.connectionState = 'closed'
     })
@@ -32,17 +50,31 @@ vi.mock('@/hermes', () => ({
       await gatewayMocks.connect(wsUrl)
       this.connectionState = 'open'
     }
-    onEvent = vi.fn(() => () => {})
+    emitEvent = (event: unknown) => this.eventListener?.(event)
+    onEvent = vi.fn((listener: (event: unknown) => void) => {
+      this.eventListener = listener
+
+      return () => {
+        if (this.eventListener === listener) {
+          this.eventListener = null
+        }
+      }
+    })
     onState = vi.fn(() => () => {})
     constructor() {
       gatewayMocks.instances.push(this as never)
     }
   }
 }))
-vi.mock('@/store/session', () => ({
-  setConnection: vi.fn(),
-  setGatewayState: vi.fn()
-}))
+vi.mock('@/store/session', async importOriginal => {
+  const actual = await importOriginal<typeof SessionStore>()
+
+  return {
+    ...actual,
+    setConnection: vi.fn(),
+    setGatewayState: vi.fn()
+  }
+})
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
 
 const {
@@ -53,6 +85,7 @@ const {
   ensureActiveGatewayOpen,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  emitLocalGatewayEvent,
   openGatewayForProfile,
   reconnectSecondaryGateways,
   retireLocalProfileGateways,
@@ -75,7 +108,20 @@ function descriptorFor(connectionId: string, profile: string) {
 }
 
 beforeEach(() => {
-  configureGatewayRegistry({ onEvent: vi.fn() } as never)
+  clearAllSessionStates()
+  configureGatewayRegistry({
+    captureScopedReconnectCleanup: (scope: string) => {
+      const staleBusyClaims = captureBusyStatesForReconnect(scope)
+
+      return () => reconcileBusyStatesOnReconnect(scope, staleBusyClaims)
+    },
+    onEvent: (
+      event: Parameters<typeof recordSessionEventScope>[0],
+      sourceScope: Parameters<typeof recordSessionEventScope>[1]
+    ) => {
+      recordSessionEventScope(event, sourceScope)
+    }
+  } as never)
   setPrimaryGateway({ connectionState: 'open' } as never, 'default')
 })
 
@@ -243,6 +289,154 @@ describe('reconnect fail-stop on a removed connection', () => {
     const callsAfterFailStop = getConnectionFor.mock.calls.length
     await ensureActiveGatewayOpen()
     expect(getConnectionFor.mock.calls.length).toBe(callsAfterFailStop)
+  })
+
+  it('preserves fresh scoped work published while a secondary reconnect awaits', async () => {
+    let releaseDial: (() => void) | undefined
+
+    const dialGate = new Promise<void>(resolve => {
+      releaseDial = resolve
+    })
+
+    const getConnectionFor = vi.fn(async () => descriptorFor('homelab', 'default'))
+
+    installDesktop({ getConnectionFor })
+    gatewayMocks.connect
+      .mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(async () => {
+        await dialGate
+      })
+
+    await ensureGatewayForAgent('homelab', 'default')
+    publishSessionState('stale-runtime', {
+      ...createClientSessionState('stale-session'),
+      awaitingResponse: true,
+      busy: true
+    })
+    recordSessionEventScope({ connectionId: 'homelab', profile: 'default', session_id: 'stale-runtime' })
+
+    const socket = gatewayMocks.instances[0] as unknown as { connectionState: string }
+    socket.connectionState = 'closed'
+    const reconnect = ensureActiveGatewayOpen()
+
+    await vi.waitFor(() => {
+      expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
+    })
+
+    publishSessionState('fresh-runtime', {
+      ...createClientSessionState('fresh-session'),
+      awaitingResponse: true,
+      busy: true
+    })
+    recordSessionEventScope({ connectionId: 'homelab', profile: 'default', session_id: 'fresh-runtime' })
+
+    releaseDial?.()
+    await reconnect
+
+    await vi.waitFor(() => {
+      expect($sessionStates.get()['stale-runtime']).toMatchObject({ awaitingResponse: false, busy: false })
+    })
+    expect($sessionStates.get()['fresh-runtime']).toMatchObject({ awaitingResponse: true, busy: true })
+  })
+
+  it('does not change a secondary owner for a synthetic local event', () => {
+    const live = {
+      ...createClientSessionState('stored-synthetic'),
+      awaitingResponse: true,
+      busy: true
+    }
+
+    publishSessionState('runtime-synthetic', live)
+    recordSessionEventScope({ profile: 'selena', session_id: 'runtime-synthetic' }, 'selena')
+    emitLocalGatewayEvent({ session_id: 'runtime-synthetic', type: 'message.delta' })
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($sessionStates.get()['runtime-synthetic']).toBe(live)
+  })
+
+  it('reconciles legacy profile work on its own secondary reconnect', async () => {
+    installDesktop({ getConnection: vi.fn(async () => descriptorFor('legacy-local', 'selena')) })
+
+    await openGatewayForProfile('selena')
+    await ensureGatewayForProfile('selena')
+    const socket = gatewayMocks.instances[0]
+
+    const stale = {
+      ...createClientSessionState('stored-selena'),
+      awaitingResponse: true,
+      busy: true
+    }
+
+    publishSessionState('runtime-selena', stale)
+    socket.emitEvent({ session_id: 'runtime-selena' })
+    socket.connectionState = 'closed'
+
+    await ensureActiveGatewayOpen()
+
+    expect($sessionStates.get()['runtime-selena']).toMatchObject({ awaitingResponse: false, busy: false })
+  })
+
+  it('keeps a reopened secondary usable when stale-state capture throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const getConnectionFor = vi.fn(async () => descriptorFor('homelab', 'default'))
+
+    configureGatewayRegistry({
+      captureScopedReconnectCleanup: () => {
+        throw new Error('capture failed')
+      },
+      onEvent: vi.fn()
+    } as never)
+    installDesktop({ getConnectionFor })
+
+    await ensureGatewayForAgent('homelab', 'default')
+    const socket = gatewayMocks.instances[0] as unknown as { connectionState: string }
+    socket.connectionState = 'closed'
+
+    const reopened = await ensureActiveGatewayOpen()
+
+    expect(reopened).not.toBeNull()
+    expect(socket.connectionState).toBe('open')
+    expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenCalledWith(
+      '[gateway] failed to capture stale busy state before secondary reconnect',
+      expect.objectContaining({ message: 'capture failed' })
+    )
+
+    await ensureActiveGatewayOpen()
+    expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
+    warn.mockRestore()
+  })
+
+  it('keeps a reopened secondary usable when stale-state cleanup throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const getConnectionFor = vi.fn(async () => descriptorFor('homelab', 'default'))
+
+    configureGatewayRegistry({
+      captureScopedReconnectCleanup: () => () => {
+        throw new Error('cleanup failed')
+      },
+      onEvent: vi.fn()
+    } as never)
+    installDesktop({ getConnectionFor })
+
+    await ensureGatewayForAgent('homelab', 'default')
+    const socket = gatewayMocks.instances[0] as unknown as { connectionState: string }
+    socket.connectionState = 'closed'
+
+    const reopened = await ensureActiveGatewayOpen()
+
+    expect(reopened).not.toBeNull()
+    expect(socket.connectionState).toBe('open')
+    expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenCalledWith(
+      '[gateway] failed to reconcile stale busy state after secondary reconnect',
+      expect.objectContaining({ message: 'cleanup failed' })
+    )
+
+    await ensureActiveGatewayOpen()
+    expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
+    warn.mockRestore()
   })
 
   it('keeps retrying on ordinary transport failures', async () => {

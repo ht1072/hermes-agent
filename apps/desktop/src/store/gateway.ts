@@ -24,7 +24,11 @@ const normKey = (profile: string | null | undefined): string => (profile ?? '').
 const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionState === 'open'
 
 interface RegistryConfig {
-  onEvent: (event: GatewayEvent) => void
+  onEvent: (event: GatewayEvent, sourceScope: string | undefined) => void
+  /** Capture the exact scoped busy claims owned by a secondary before its
+   * reconnect starts. The returned closure retires only that frozen set after
+   * the socket reopens, avoiding a runtime import cycle back into this store. */
+  captureScopedReconnectCleanup?: (scope: string) => () => void
   onActiveConnectionInvalidated?: (fallbackProfile: string, activationEpoch: number) => void
   onActiveConnectionChanged?: (connection: HermesConnection) => void
   /**
@@ -172,7 +176,7 @@ export function configureGatewayRegistry(cfg: RegistryConfig): void {
  * registry is configured.
  */
 export function emitLocalGatewayEvent(event: GatewayEvent): void {
-  g.config?.onEvent(event)
+  g.config?.onEvent(event, undefined)
 }
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
@@ -379,23 +383,29 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   entry.reconnecting = true
 
   try {
+    let cleanupStaleBusyClaims: (() => void) | undefined
+
+    try {
+      cleanupStaleBusyClaims = g.config?.captureScopedReconnectCleanup?.(entry.scope)
+    } catch (error) {
+      console.warn('[gateway] failed to capture stale busy state before secondary reconnect', error)
+    }
+
     await openSecondary(entry)
     entry.reconnectAttempt = 0
     // The re-dialed backend may have respawned and re-minted runtime ids —
     // busy flags recorded from THIS socket's pre-drop events would then never
-    // receive their terminal busy:false, leaving the session's running arc
-    // armed forever (#53902/#73082 stale-flag half). Scoped: only runtimes
-    // whose events arrived on this connection are reconciled; live work on
-    // other sockets is untouched, and a genuinely live turn here re-asserts
-    // busy on its next event. Lazy import: a static edge here closes a module
-    // cycle (session-states → … → gateway) that leaves nanostores atoms
-    // undefined at init for whichever module loads second. Best-effort catch:
-    // under partial vi.mock('@/hermes') harnesses the transitive graph can
-    // fail to load — a skipped reconcile there must not surface as an
-    // unhandled rejection (the real graph always loads in production).
-    void import('@/store/session-states')
-      .then(({ reconcileBusyStatesOnReconnect }) => reconcileBusyStatesOnReconnect(entry.scope))
-      .catch(() => undefined)
+    // receive their terminal busy:false. The cleanup closure captured only
+    // this scope's pre-reconnect claims before any await, so work published
+    // while the socket reopens cannot be retired as stale. Cleanup is
+    // best-effort bookkeeping after transport success; it must not reclassify
+    // an open socket as a failed reconnect.
+
+    try {
+      cleanupStaleBusyClaims?.()
+    } catch (error) {
+      console.warn('[gateway] failed to reconcile stale busy state after secondary reconnect', error)
+    }
   } catch (error) {
     // The registry no longer knows this connection (removed while we were
     // backing off), or Electron's deletion guard reports the profile itself
@@ -469,7 +479,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
   // Events keep carrying the bare profile — session routing is profile-keyed
   // everywhere. connectionId rides along for surfaces that need the source.
   entry.offEvent = gateway.onEvent(event =>
-    g.config?.onEvent({ ...event, profile, ...(connectionId ? { connectionId } : {}) })
+    g.config?.onEvent({ ...event, profile, ...(connectionId ? { connectionId } : {}) }, scope)
   )
   entry.offState = gateway.onState(state => {
     reportGatewayState(scope, state)
